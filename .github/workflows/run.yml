@@ -1,30 +1,152 @@
-name: 刷步数
+name: 刷步数 Pro
+
+# 只给最小只读权限，更安全
+permissions:
+  contents: read
 
 on:
+  # 定时（UTC）：北京时 07:40 / 12:40 / 20:40
   schedule:
-    - cron: '40 1,4,7,10,12,23 * * *'
+    - cron: '40 23,4,12 * * *'
+  # 仍然支持手动触发
   workflow_dispatch:
+
+# 防重复：同一组任务新触发会取消在途的旧任务
+concurrency:
+  group: mimotion
+  cancel-in-progress: true
+
+# 统一时区到北京，日志直观
+env:
+  TZ: Asia/Shanghai
+  # 可选：显式禁用动态分段（true/1/yes），则完全使用 secrets.CONFIG 里的区间
+  DISABLE_DYNAMIC: ""
+  # 可选：强制固定区间（优先级最高，留空则走动态分段）
+  FIXED_MIN: ""
+  FIXED_MAX: ""
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - name: Checkout codes
-        uses: actions/checkout@v3
-      - name: Update system and install zsh
-        run: |
-          sudo -E apt-get -qq update
-          sudo -E apt-get install zsh -y
-          
-      - name: 初始化Python
-        uses: actions/setup-python@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python (cache pip)
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.8
-          
-      - name: 开始
-        env:
-            CONFIG: ${{ secrets.CONFIG }}
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
         run: |
-          pip3 install requests pytz
-          python3 main.py
+          python -m pip install -U pip
+          pip install requests pytz
+
+      # 读取 secrets.CONFIG，按北京时间自动选择更“像真人”的步数区间
+      # 规则：0-10点 5k-8k；11-16点 12k-18k；17-23点 19k-26k
+      - name: Build dynamic CONFIG (Beijing time slots)
+        env:
+          CONFIG: ${{ secrets.CONFIG }}
+          DISABLE_DYNAMIC: ${{ env.DISABLE_DYNAMIC }}
+          FIXED_MIN: ${{ env.FIXED_MIN }}
+          FIXED_MAX: ${{ env.FIXED_MAX }}
+        run: |
+          python - << 'PY'
+          import os, json
+          from datetime import datetime
+          import pytz
+
+          raw = os.environ.get("CONFIG", "").strip()
+          if not raw:
+            print("::error::Missing secrets.CONFIG")
+            raise SystemExit(1)
+
+          try:
+            cfg = json.loads(raw)
+          except Exception as e:
+            print("::error::CONFIG is not valid JSON:", e)
+            raise SystemExit(1)
+
+          # 允许用户强制固定区间（最高优先级）
+          fx_min = os.environ.get("FIXED_MIN", "").strip()
+          fx_max = os.environ.get("FIXED_MAX", "").strip()
+          force = fx_min.isdigit() and fx_max.isdigit()
+
+          # 是否禁用动态分段
+          disable_dynamic = os.environ.get("DISABLE_DYNAMIC","").lower() in ("1","true","yes")
+
+          # 北京时间
+          now = datetime.now(pytz.timezone("Asia/Shanghai"))
+          h = now.hour
+
+          # 默认分段（更自然）
+          seg = None
+          if   0 <= h <= 10: seg = (5000, 8000)     # 早
+          elif 11 <= h <=16: seg = (12000, 18000)   # 中
+          else:              seg = (19000, 26000)   # 晚
+
+          if force:
+            mn, mx = int(fx_min), int(fx_max)
+            reason = f"force-fixed {mn}-{mx}"
+          elif disable_dynamic:
+            # 完全沿用用户在 CONFIG 中给的区间
+            try:
+              mn, mx = int(str(cfg["MIN_STEP"])), int(str(cfg["MAX_STEP"]))
+              reason = f"keep-raw {mn}-{mx}"
+            except Exception:
+              print("::error::CONFIG missing MIN_STEP/MAX_STEP when DISABLE_DYNAMIC is set")
+              raise SystemExit(1)
+          else:
+            mn, mx = seg
+            reason = f"auto-slot-{h:02d}h {mn}-{mx}"
+
+          # 写回覆盖（main.py 读取字符串）
+          cfg["MIN_STEP"] = str(mn)
+          cfg["MAX_STEP"] = str(mx)
+
+          # 输出到文件，下一步 export 到环境变量 CONFIG 再运行
+          with open("merged_config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, separators=(",",":"))
+
+          # 写 Step Summary（不包含账号/密码，仅展示区间与选择原因）
+          summary = f"**Range**: {mn}-{mx}  |  **Mode**: {reason}\n"
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", "summary.md"), "a", encoding="utf-8") as s:
+            s.write(summary)
+          PY
+
+      # 随机抖动 0~600 秒，避免所有人同分钟同时打 API
+      - name: Random jitter (0-600s)
+        run: |
+          JITTER=$((RANDOM % 600))
+          echo "sleep ${JITTER}s to avoid burst..."
+          sleep "${JITTER}s"
+
+      # 带指数退避的重试（最多 3 次）
+      - name: Run with retries (max 3)
+        shell: bash
+        run: |
+          set +e
+          export CONFIG="$(cat merged_config.json)"
+
+          attempt=1
+          max_attempts=3
+          while true; do
+            echo "==> attempt ${attempt}/${max_attempts}"
+            python main.py
+            rc=$?
+            if [ $rc -eq 0 ]; then
+              echo "run ok"
+              break
+            fi
+            if [ $attempt -ge $max_attempts ]; then
+              echo "::error::run failed after ${max_attempts} attempts (rc=${rc})"
+              exit $rc
+            fi
+            # 指数退避 + 少许抖动
+            backoff=$(( attempt * attempt * 10 + RANDOM % 7 ))
+            echo "will retry after ${backoff}s..."
+            sleep "${backoff}s"
+            attempt=$((attempt+1))
+          done
